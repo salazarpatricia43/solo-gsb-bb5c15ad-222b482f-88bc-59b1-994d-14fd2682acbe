@@ -62,6 +62,13 @@ async def cancel(client: AsyncClient, bid: str, reason: str):
     return await client.post(f"/barriers/{bid}/cancel", json={"reason": reason})
 
 
+async def replace(client: AsyncClient, bid: str, original: str, replacement: str):
+    return await client.post(
+        f"/barriers/{bid}/replace",
+        json={"participant_id": original, "replacement_id": replacement},
+    )
+
+
 @pytest.mark.asyncio
 async def test_health_and_root():
     async with await _client() as c:
@@ -1257,4 +1264,473 @@ async def test_extend_and_cancel_checkin_races_have_unique_outcome():
                 winners.append("cancelled")
 
         assert set(winners) == {"reached", "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# 运行中参与者替补 POST /barriers/{id}/replace
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_replace_basic_swaps_roster_and_view_reflects_it():
+    """未报到成员被名单外新标识原子替换：200，名单更新，原成员不再可报到。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=15)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+
+        r = await replace(c, bid, "b", "b-backup")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "replaced"
+        assert body["participant_id"] == "b"
+        assert body["replacement_id"] == "b-backup"
+        assert body["group"] is None
+        assert datetime.fromisoformat(body["replaced_at"]).tzinfo is not None
+
+        view = body["view"]
+        assert view["status"] == "waiting"
+        assert view["participants"] == ["a", "b-backup", "c"]
+        assert view["checked_in"] == ["a"]
+        assert view["checked_count"] == 1
+
+        # GET 同样反映替换后的名单
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["participants"] == ["a", "b-backup", "c"]
+
+        # 原成员已不在名单：报到 403（NotAParticipant）；新成员可正常报到
+        assert (await checkin(c, bid, "b")).status_code == 403
+        r = await checkin(c, bid, "b-backup")
+        assert r.status_code == 200 and r.json()["status"] == "checked_in"
+
+        # 替补本身不是报到：checked 计数不因其变化
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["checked_in"] == ["a", "b-backup"]
+
+
+@pytest.mark.asyncio
+async def test_replace_inherits_group_and_quota_uses_new_member():
+    """分组屏障下替补继承原分组：新成员以原组身份补齐配额并触发达标。"""
+    async with await _client() as c:
+        participants = ["a1", "a2", "b1"]
+        groups = {"a1": "A", "a2": "A", "b1": "B"}
+        b = await create_barrier(
+            c, participants, threshold=3, ttl_s=15,
+            groups=groups, quotas={"A": 2, "B": 1},
+        )
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a1")
+        await checkin(c, bid, "b1")
+
+        # a2（A 组，未报到）替换为 a2-new，继承 A 组
+        r = await replace(c, bid, "a2", "a2-new")
+        assert r.status_code == 200, r.text
+        assert r.json()["group"] == "A"
+        view = r.json()["view"]
+        assert view["participant_groups"]["a2-new"] == "A"
+        assert "a2" not in view["participant_groups"]
+        prog = {x["group"]: x for x in view["group_progress"]}
+        assert prog["A"]["checked_count"] == 1  # 换人不改变任何报到计数
+        assert prog["B"]["checked_count"] == 1
+
+        # 新成员以 A 组身份报到：A=2、B=1、总数 3，唯一触发达标
+        r = await checkin(c, bid, "a2-new")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "reached" and body["triggered"] is True
+        assert sorted(body["quorum"]) == ["a1", "a2-new", "b1"]
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["participants"] == ["a1", "a2-new", "b1"]
+        assert g["participant_groups"] == {"a1": "A", "a2-new": "A", "b1": "B"}
+
+
+@pytest.mark.asyncio
+async def test_replace_request_validation_422():
+    """空标识、纯空白、两个标识相同均返回 422（空白会被去除）。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=15)
+        bid = b["barrier_id"]
+
+        async def post(body):
+            return await c.post(f"/barriers/{bid}/replace", json=body)
+
+        assert (await post({"participant_id": " ", "replacement_id": "x"})).status_code == 422
+        assert (await post({"participant_id": "a", "replacement_id": ""})).status_code == 422
+        assert (await post({"participant_id": "a", "replacement_id": "   "})).status_code == 422
+        # 去除首尾空白后相同
+        r = await post({"participant_id": "a", "replacement_id": " a "})
+        assert r.status_code == 422
+        # 缺字段
+        assert (await post({"participant_id": "a"})).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_replace_rejects_unknown_checked_and_existing_replacement():
+    """原成员不存在/已被换掉 -> 404；原成员已报到、新标识已在名单 -> 409。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=15)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+
+        # 屏障从未声明过的成员 -> 404
+        r = await replace(c, bid, "ghost", "ghost-x")
+        assert r.status_code == 404
+
+        # 新标识已在名单内 -> 409
+        r = await replace(c, bid, "b", "c")
+        assert r.status_code == 409
+
+        # 原成员已报到 -> 409
+        r = await replace(c, bid, "a", "a-new")
+        assert r.status_code == 409
+        # 报到与名单均未被改写
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["participants"] == ["a", "b", "c"]
+        assert g["checked_in"] == ["a"]
+
+        # 成功把 b 换成 b2 后，再次以 b 为原成员替补 -> 404（已被换下）
+        assert (await replace(c, bid, "b", "b2")).status_code == 200
+        assert (await replace(c, bid, "b", "b3")).status_code == 404
+
+        # 新标识已在（替换后的）名单内：b2 是现成员 -> 409
+        assert (await replace(c, bid, "c", "b2")).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_replace_chained_and_revert_allowed():
+    """同一席位可连续替补；被换下的旧标识作为名单外标识可再次被换入。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=15)
+        bid = b["barrier_id"]
+
+        assert (await replace(c, bid, "b", "b1")).status_code == 200
+        assert (await replace(c, bid, "b1", "b2")).status_code == 200
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["participants"] == ["a", "b2"]
+
+        # b 已在名单外，可以把 b2 再换回 b
+        assert (await replace(c, bid, "b2", "b")).status_code == 200
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["participants"] == ["a", "b"]
+        assert (await checkin(c, bid, "b")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_replace_rejected_in_terminal_states():
+    """达标 / 取消 / 截止后替补一律 409，终态绝不因替补改变。"""
+    async with await _client() as c:
+        # reached
+        b = await create_barrier(c, ["a", "b"], threshold=1, ttl_s=15)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+        r = await replace(c, bid, "b", "b-new")
+        assert r.status_code == 409
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "reached"
+        assert g["quorum"] == ["a"]
+        assert g["participants"] == ["a", "b"]
+
+        # cancelled
+        b2 = await create_barrier(c, ["x", "y"], threshold=2, ttl_s=15)
+        bid2 = b2["barrier_id"]
+        await cancel(c, bid2, "停")
+        r = await replace(c, bid2, "y", "y-new")
+        assert r.status_code == 409
+        g = (await c.get(f"/barriers/{bid2}")).json()
+        assert g["status"] == "cancelled"
+        assert g["participants"] == ["x", "y"]
+
+        # expired
+        b3 = await create_barrier(c, ["p", "q"], threshold=2, ttl_s=1)
+        bid3 = b3["barrier_id"]
+        await asyncio.sleep(1.2)
+        g = (await c.get(f"/barriers/{bid3}")).json()
+        assert g["status"] == "expired"
+        r = await replace(c, bid3, "q", "q-new")
+        assert r.status_code == 409, r.text
+        g = (await c.get(f"/barriers/{bid3}")).json()
+        assert g["status"] == "expired"
+        assert g["participants"] == ["p", "q"]
+
+        # 屏障不存在 -> 404
+        assert (await replace(c, "deadbeefdeadbeef", "a", "b")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_replace_records_paginated_audit_event():
+    """成功替补在换人同一原子操作内追加 replaced 事件，与报到事件统一分页。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=15)
+        bid = b["barrier_id"]
+        assert (await checkin(c, bid, "a")).json()["status"] == "checked_in"
+        assert (await replace(c, bid, "b", "b-new")).status_code == 200
+        assert (await checkin(c, bid, "b-new")).json()["status"] == "checked_in"
+
+        body = (await get_events(c, bid)).json()
+        assert body["next_cursor"] == 3
+        events = body["events"]
+        assert [e["seq"] for e in events] == [1, 2, 3]
+        rep = events[1]
+        assert rep["result"] == "replaced"
+        assert rep["participant_id"] == "b-new"
+        assert rep["original_participant_id"] == "b"
+        assert datetime.fromisoformat(rep["ts"]).tzinfo is not None
+        # 报到事件的替补专属字段为 null（与替补事件区分）
+        assert events[0]["original_participant_id"] is None
+        assert events[2]["original_participant_id"] is None
+
+        # 分页：每页 1 条游标前进，不重不漏
+        page1 = (await get_events(c, bid, cursor=0, limit=1)).json()
+        assert [e["seq"] for e in page1["events"]] == [1]
+        page2 = (await get_events(c, bid, cursor=page1["next_cursor"], limit=1)).json()
+        assert [e["seq"] for e in page2["events"]] == [2]
+        page3 = (await get_events(c, bid, cursor=page2["next_cursor"], limit=1)).json()
+        assert [e["seq"] for e in page3["events"]] == [3]
+
+
+@pytest.mark.asyncio
+async def test_failed_replacements_produce_no_events():
+    """被拒绝的替补（未知成员、已报到、名单内新标识、终态）不产生任何事件。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=1, ttl_s=15)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")  # 同时达标
+
+        assert (await replace(c, bid, "ghost", "g1")).status_code == 404
+        assert (await replace(c, bid, "a", "a2")).status_code == 409  # 已报到
+        assert (await replace(c, bid, "b", "a")).status_code == 409  # 新标识在名单
+        assert (await replace(c, bid, "b", "b2")).status_code == 409  # 已达标终态
+
+        events = (await get_events(c, bid)).json()["events"]
+        assert [e["result"] for e in events] == ["reached"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_replace_same_original_only_one_wins():
+    """两个替补并发争抢同一未报到成员：Redis 顺序唯一，恰好一个成功。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=15)
+        bid = b["barrier_id"]
+
+        results = await asyncio.gather(
+            replace(c, bid, "b", "b-x"),
+            replace(c, bid, "b", "b-y"),
+        )
+        statuses = sorted(r.status_code for r in results)
+        assert statuses == [200, 404], statuses
+
+        ok = next(r for r in results if r.status_code == 200).json()
+        winner = ok["replacement_id"]
+        assert winner in ("b-x", "b-y")
+        loser = "b-y" if winner == "b-x" else "b-x"
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["participants"] == ["a", winner, "c"]
+        # 只有一条 replaced 事件（在赢家报到之前检查，避免混入报到事件）
+        events = (await get_events(c, bid)).json()["events"]
+        assert len(events) == 1 and events[0]["result"] == "replaced"
+        assert events[0]["participant_id"] == winner
+        # 赢家可报到；输家的新标识仍在名单外
+        assert (await checkin(c, bid, winner)).status_code == 200
+        assert (await checkin(c, bid, loser)).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_concurrent_replace_distinct_originals_both_win():
+    """并发替补不同成员：两个都成功，分组继承各自独立，名单唯一确定。"""
+    async with await _client() as c:
+        participants = ["a1", "a2", "b1", "b2"]
+        groups = {p: ("A" if p.startswith("a") else "B") for p in participants}
+        b = await create_barrier(
+            c, participants, threshold=4, ttl_s=15,
+            groups=groups, quotas={"A": 2, "B": 2},
+        )
+        bid = b["barrier_id"]
+
+        results = await asyncio.gather(
+            replace(c, bid, "a2", "a2-new"),
+            replace(c, bid, "b2", "b2-new"),
+        )
+        assert sorted(r.status_code for r in results) == [200, 200], results
+        bodies = [r.json() for r in results]
+        assert {b_["participant_id"]: b_["group"] for b_ in bodies} == {
+            "a2": "A",
+            "b2": "B",
+        }
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["participants"] == ["a1", "a2-new", "b1", "b2-new"]
+        assert g["participant_groups"] == {
+            "a1": "A", "a2-new": "A", "b1": "B", "b2-new": "B",
+        }
+        events = (await get_events(c, bid)).json()["events"]
+        assert [e["result"] for e in events] == ["replaced", "replaced"]
+
+
+@pytest.mark.asyncio
+async def test_replace_and_checkin_race_unique_outcome():
+    """替补与原成员报到用同一事务固定入队顺序交替执行：先执行者唯一胜出。"""
+    from app.barrier_store import CHECKIN_SCRIPT, SUBSTITUTE_SCRIPT
+    from app.main import app
+
+    async with await _client() as c:
+        r = app.state.store.redis
+        outcomes = []
+
+        for i in range(40):
+            b = await create_barrier(c, ["a", "b"], threshold=1, ttl_s=30)
+            bid = b["barrier_id"]
+            keys = [
+                f"barrier:{bid}",
+                f"barrier:{bid}:roster",
+                f"barrier:{bid}:checked",
+                f"barrier:{bid}:frozen",
+                f"barrier:{bid}:events",
+                f"barrier:{bid}:cancel",
+                f"barrier:{bid}:gmap",
+                f"barrier:{bid}:gcheck",
+            ]
+            now = f"{time.time():.3f}"
+            pipe = r.pipeline(transaction=True)
+            if i % 2 == 0:
+                # 先替补后报到：替补成功；原成员 a 已不在名单，报到必为 not_participant
+                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "a", "a-new", now)
+                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
+            else:
+                # 先报到（达标）后替补：报到 reached；替补必为 reached 冲突
+                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
+                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "a", "a-new", now)
+            first_raw, second_raw = await pipe.execute()
+
+            g = await c.get(f"/barriers/{bid}")
+            status = g.json()["status"]
+
+            if i % 2 == 0:
+                assert first_raw[0] == "replaced", first_raw
+                assert second_raw[0] == "not_participant", second_raw
+                # 换人后屏障仍 waiting：新成员可以报到达标
+                assert status == "waiting"
+                assert g.json()["participants"] == ["a-new", "b"]
+                cr = await checkin(c, bid, "a-new")
+                assert cr.json()["status"] == "reached"
+                outcomes.append("replaced")
+            else:
+                # 先报到（达标）后替补：报到 reached；替补因原成员已报到被拒绝
+                # （名单/报到校验先于终态校验，返回 already_checked_in，同为拒绝）
+                assert first_raw[0] == "reached", first_raw
+                assert second_raw[0] == "already_checked_in", second_raw
+                assert status == "reached"
+                # 终态不可复活：HTTP 替补同样 409，名单不变
+                assert (await replace(c, bid, "b", "b-new")).status_code == 409
+                assert g.json()["participants"] == ["a", "b"]
+                outcomes.append("checkin")
+
+        assert set(outcomes) == {"replaced", "checkin"}, Counter(outcomes)
+
+
+@pytest.mark.asyncio
+async def test_replace_races_with_cancel_and_extend():
+    """替补与取消 / 延期两两原子竞争：终态后替补 409；先替补后取消/延期正常。"""
+    from app.barrier_store import (
+        CANCEL_SCRIPT,
+        EXTEND_SCRIPT,
+        SUBSTITUTE_SCRIPT,
+    )
+    from app.main import app
+
+    async with await _client() as c:
+        r = app.state.store.redis
+
+        for i in range(30):
+            b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=60)
+            bid = b["barrier_id"]
+            keys = [
+                f"barrier:{bid}",
+                f"barrier:{bid}:roster",
+                f"barrier:{bid}:checked",
+                f"barrier:{bid}:frozen",
+                f"barrier:{bid}:events",
+                f"barrier:{bid}:cancel",
+                f"barrier:{bid}:gmap",
+                f"barrier:{bid}:gcheck",
+            ]
+            now = f"{time.time():.3f}"
+            new_deadline = f"{time.time() + 120:.3f}"
+            pipe = r.pipeline(transaction=True)
+            mode = i % 4
+            if mode == 0:
+                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "b", "b-new", now)
+                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
+            elif mode == 1:
+                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
+                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "b", "b-new", now)
+            elif mode == 2:
+                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "b", "b-new", now)
+                pipe.eval(EXTEND_SCRIPT, 8, *keys, new_deadline, now, "86400000")
+            else:
+                pipe.eval(EXTEND_SCRIPT, 8, *keys, new_deadline, now, "86400000")
+                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "b", "b-new", now)
+            first_raw, second_raw = await pipe.execute()
+
+            g = (await c.get(f"/barriers/{bid}")).json()
+
+            if mode == 0:
+                assert first_raw[0] == "replaced", first_raw
+                assert second_raw[0] == "cancelled", second_raw
+                assert g["status"] == "cancelled"
+                assert g["participants"] == ["a", "b-new"]  # 换人快照保留
+                assert (await replace(c, bid, "a", "a2")).status_code == 409
+            elif mode == 1:
+                assert first_raw[0] == "cancelled", first_raw
+                assert second_raw[0] == "cancelled", second_raw  # 替补冲突
+                assert g["status"] == "cancelled"
+                assert g["participants"] == ["a", "b"]  # 名单未被改写
+            elif mode == 2:
+                assert first_raw[0] == "replaced", first_raw
+                assert second_raw[0] == "extended", second_raw
+                assert g["status"] == "waiting"
+                assert g["participants"] == ["a", "b-new"]
+                assert datetime.fromisoformat(g["deadline"]) > datetime.fromisoformat(b["deadline"])
+            else:
+                assert first_raw[0] == "extended", first_raw
+                assert second_raw[0] == "replaced", second_raw
+                assert g["status"] == "waiting"
+                assert g["participants"] == ["a", "b-new"]
+
+
+@pytest.mark.asyncio
+async def test_waiter_woken_on_replace_and_sees_new_roster():
+    """替补成功发布 participant_replaced：已挂起的 /wait 被唤醒回读新名单，
+    屏障仍 waiting 时继续等待；随后达标时再次被唤醒返回 reached。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+
+        async def wait_view():
+            async with await _client() as c2:
+                started = time.time()
+                r = await c2.get(f"/barriers/{bid}/wait")
+                return time.time() - started, r
+
+        waiter = asyncio.create_task(wait_view())
+        await asyncio.sleep(0.4)  # 确保已订阅并挂起
+
+        r = await replace(c, bid, "b", "b-new")
+        assert r.status_code == 200
+
+        # 唤醒回读发生后等待仍应继续（不能错误返回）；留一点时间处理消息
+        await asyncio.sleep(0.4)
+        assert not waiter.done(), "替补不应让 waiting 的屏障提前结束等待"
+
+        # 新成员报到达标：等待者被唤醒拿到含新名单的终态
+        await checkin(c, bid, "b-new")
+        elapsed, r = await asyncio.wait_for(waiter, timeout=5)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "reached"
+        assert sorted(body["quorum"]) == ["a", "b-new"]
+        assert body["participants"] == ["a", "b-new"]
+        assert elapsed < 5
 

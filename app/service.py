@@ -145,12 +145,14 @@ async def wait_for_settle(
 
     主通道为 Pub/Sub：先订阅，再检查一次状态（消除“先检查后订阅”的丢消息窗口）；
     轮询作为兜底，覆盖发布丢失 / 截止时间到达（截止不发布消息）两种情况。
-    多个等待者各自订阅同一频道，达标（reached）、取消（cancelled）或运行中
-    延期（deadline_extended）发布时全部被唤醒。
+    多个等待者各自订阅同一频道，达标（reached）、取消（cancelled）、运行中
+    延期（deadline_extended）或运行中替补（participant_replaced）发布时全部
+    被唤醒。
 
     每次被唤醒（以及每轮轮询）都重新读取 meta 再组装视图：延期只改 meta 中的
     deadline，等待者必须以最新 deadline 继续等待，绝不能按进入请求时的旧
-    deadline 误报 expired。
+    deadline 误报 expired；替补只改 roster / gmap，等待者回读 meta 后看到的
+    即是替换后的名单与分组映射。
     """
     def _current_meta(latest: BarrierMeta | None) -> BarrierMeta:
         # 极端情况下 meta 恰好在 TTL 点被回收：沿用最后一份已知 meta，

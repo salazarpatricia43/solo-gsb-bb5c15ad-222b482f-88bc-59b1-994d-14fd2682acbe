@@ -6,8 +6,9 @@
   POST   /barriers/{bid}/checkin            参与者幂等报到
   POST   /barriers/{bid}/cancel             主动取消（与达标报到原子竞争，先发生者为唯一终态）
   PATCH  /barriers/{bid}/deadline           运行中延期（仅 waiting 且新时间更晚时原子生效）
+  POST   /barriers/{bid}/replace            运行中替补（未报到成员原子换为名单外新标识并继承分组）
   GET    /barriers/{bid}/wait               阻塞等待达标 / 取消 / 截止
-  GET    /barriers/{bid}/events             报到审计事件（cursor/limit 分页）
+  GET    /barriers/{bid}/events             审计事件（报到 + 替补，cursor/limit 分页）
 
 交互文档：GET /docs（Swagger UI）
 """
@@ -23,13 +24,17 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from .barrier_store import (
+    AlreadyCheckedIn,
     BarrierCancelled,
     BarrierDeadlineConflict,
     BarrierExpired,
     BarrierNotFound,
     BarrierReached,
     BarrierStore,
+    BarrierSubstituteConflict,
     NotAParticipant,
+    ParticipantNotInRoster,
+    ReplacementInRoster,
 )
 from .config import load_settings
 from .models import (
@@ -42,6 +47,8 @@ from .models import (
     CheckinResponse,
     CreateBarrierRequest,
     ExtendDeadlineRequest,
+    ReplaceRequest,
+    ReplaceResponse,
 )
 from .service import _dt, build_view, wait_for_settle
 
@@ -58,8 +65,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="任务收尾屏障 API",
-    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止、运行中延期。",
-    version="1.3.0",
+    description=(
+        "并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止、"
+        "运行中延期与运行中参与者替补。"
+    ),
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -87,6 +97,7 @@ async def root() -> dict[str, object]:
             "checkin": "POST /barriers/{barrier_id}/checkin",
             "cancel": "POST /barriers/{barrier_id}/cancel",
             "extend": "PATCH /barriers/{barrier_id}/deadline",
+            "replace": "POST /barriers/{barrier_id}/replace",
             "wait": "GET /barriers/{barrier_id}/wait",
             "events": "GET /barriers/{barrier_id}/events",
         },
@@ -280,13 +291,86 @@ async def extend_deadline(
     return await build_view(svc, latest if latest is not None else meta)
 
 
+@app.post(
+    "/barriers/{barrier_id}/replace",
+    response_model=ReplaceResponse,
+    tags=["barriers"],
+)
+async def replace_participant(
+    barrier_id: str, payload: ReplaceRequest, request: Request
+) -> ReplaceResponse:
+    """运行中参与者替补：把尚未报到的原成员原子替换为名单外的新标识。
+
+    - 仅当屏障仍处于 waiting、原参与者**在名单内且尚未报到**、新标识**不在
+      当前名单内**时生效；替换在同一段 Redis Lua 脚本内完成名单改写、
+      分组继承（新成员继承原成员的分组）与审计事件追加；
+    - 达标 / 取消 / 截止均为终态，替补返回 409，终态绝不复活；原成员已先
+      报到或已被先发生的替补换掉、新标识已在名单内也一律拒绝（409/404）；
+    - 替补与报到、取消、延期及其他替补并发时，全部由 Redis 单线程串行化：
+      以实际生效顺序为准，原成员的去留与新标识的加入只有唯一一致结果；
+    - 成功后发布 participant_replaced 通知，已在 /wait 挂起的等待者立即
+      回读替换后的名单与分组继续等待，并在同一原子操作中追加一条
+      ``replaced`` 审计事件（可在 /events 中按 seq 分页查询）。
+    """
+    meta = await _load_meta(request, barrier_id)
+    svc = store(request)
+    try:
+        result = await svc.substitute(
+            barrier_id,
+            original_participant_id=payload.participant_id,
+            replacement_id=payload.replacement_id,
+        )
+    except ParticipantNotInRoster:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"参与者 {payload.participant_id!r} 不在该屏障当前名单内"
+                "（可能已被替补换下）"
+            ),
+        )
+    except AlreadyCheckedIn:
+        raise HTTPException(
+            status_code=409,
+            detail=f"参与者 {payload.participant_id!r} 已报到，不能被替补",
+        )
+    except ReplacementInRoster:
+        raise HTTPException(
+            status_code=409,
+            detail=f"替补标识 {payload.replacement_id!r} 已在名单内，必须使用名单外的新标识",
+        )
+    except BarrierSubstituteConflict as exc:
+        reason = exc.args[0] if exc.args else "conflict"
+        detail = {
+            "reached": "屏障已达标，终态不可替补",
+            "cancelled": "屏障已被取消，替补被拒绝",
+            "expired": "屏障已过截止时间，替补被拒绝",
+        }.get(reason, "替补冲突")
+        raise HTTPException(status_code=409, detail=detail)
+    except BarrierNotFound:
+        raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
+
+    # 名单与分组映射已在 Lua 内改写：必须重新读取 meta，视图才能反映换人结果。
+    latest = await svc.get_meta(barrier_id)
+    view = await build_view(svc, latest if latest is not None else meta)
+    return ReplaceResponse(
+        barrier_id=barrier_id,
+        status="replaced",
+        participant_id=result.original_participant_id,
+        replacement_id=result.replacement_id,
+        group=result.group,
+        replaced_at=_dt(result.replaced_at),
+        view=view,
+    )
+
+
 @app.get("/barriers/{barrier_id}/wait", response_model=BarrierView, tags=["barriers"])
 async def wait_barrier(barrier_id: str, request: Request) -> BarrierView:
     """阻塞等待直到屏障达标、被取消（立即返回终态快照）或截止（返回报到成员与缺席名单）。
 
-    多个等待者同时挂起：达标、取消或运行中延期时通过 Redis Pub/Sub 一并唤醒，
-    轮询为兜底。收到延期通知后回读最新 deadline 继续等待，不会按旧截止时间
-    误报 expired。最长挂起时间受 BARRIER_MAX_WAIT_S 限制。
+    多个等待者同时挂起：达标、取消、运行中延期或运行中替补时通过 Redis
+    Pub/Sub 一并唤醒，轮询为兜底。收到延期通知后回读最新 deadline 继续等待，
+    不会按旧截止时间误报 expired；收到替补通知后回读替换后的名单继续等待。
+    最长挂起时间受 BARRIER_MAX_WAIT_S 限制。
     """
     meta = await _load_meta(request, barrier_id)
     return await wait_for_settle(
@@ -312,11 +396,14 @@ async def list_events(
         default=100, ge=1, le=1000, description="单页最大事件数（1-1000）"
     ),
 ) -> BarrierEventsPage:
-    """查询报到审计事件（按 seq 升序，cursor/limit 分页）。
+    """查询审计事件（按 seq 升序，cursor/limit 分页）。
 
     每次名单成员报到（首次、重复、达标、迟到）都会在与状态变更同一 Redis
-    原子操作中追加一条事件；非名单成员、截止后报到等错误请求不产生事件。
-    事件只增不改，游标分页在并发报到下稳定不重不漏；屏障回收后事件一并消失。
+    原子操作中追加一条事件；运行中参与者替补成功时也在换人脚本内追加一条
+    ``replaced`` 事件（``participant_id`` 为换上的新标识，
+    ``original_participant_id`` 为被换下的原成员）。非名单成员、截止后报到、
+    被拒绝的替补等错误请求不产生事件。事件只增不改，游标分页在并发写入下
+    稳定不重不漏；屏障回收后事件一并消失。
     """
     await _load_meta(request, barrier_id)
     events, next_cursor = await store(request).list_events(barrier_id, cursor, limit)
@@ -328,6 +415,7 @@ async def list_events(
                 participant_id=e["participant_id"],
                 result=e["result"],
                 ts=_dt(e["ts"]),
+                original_participant_id=e.get("original_participant_id"),
             )
             for e in events
         ],

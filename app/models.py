@@ -220,13 +220,63 @@ class CancelResponse(BaseModel):
     view: BarrierView
 
 
+class ReplaceRequest(BaseModel):
+    participant_id: str = Field(
+        ..., min_length=1, description="被替换的原参与者标识（必须仍在名单内且尚未报到）"
+    )
+    replacement_id: str = Field(
+        ..., min_length=1, description="换上的新参与者标识（必须是当前名单外的新标识）"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ReplaceRequest":
+        # 与创建名单一致地去除首尾空白；两个标识清洗后都不得为空、不得相同。
+        original = self.participant_id.strip()
+        replacement = self.replacement_id.strip()
+        if not original:
+            raise ValueError("participant_id 不得为空白字符串")
+        if not replacement:
+            raise ValueError("replacement_id 不得为空白字符串")
+        if original == replacement:
+            raise ValueError("replacement_id 必须是名单外的新标识，不能与原参与者相同")
+        self.participant_id = original
+        self.replacement_id = replacement
+        return self
+
+
+class ReplaceResponse(BaseModel):
+    barrier_id: str
+    status: str = Field(description="replaced（本次替补原子生效）")
+    participant_id: str = Field(description="被换下的原参与者标识")
+    replacement_id: str = Field(description="换上的新参与者标识（换人后即为现名单成员）")
+    group: str | None = Field(
+        default=None,
+        description="新成员继承自原成员的分组名；未启用分组配额时为 null",
+    )
+    replaced_at: datetime = Field(description="替补生效时间（UTC）")
+    view: BarrierView
+
+
 class CheckinEvent(BaseModel):
     seq: int = Field(description="事件序号，从 1 开始单调递增，只追加不回改")
-    participant_id: str = Field(description="报到的参与者标识")
+    participant_id: str = Field(
+        description=(
+            "事件相关的参与者标识：报到事件为报到者；替补事件为换上的新标识"
+        )
+    )
     result: str = Field(
-        description="checked_in | already_checked_in | reached | late"
+        description=(
+            "checked_in | already_checked_in | reached | late | replaced"
+            "（replaced 为运行中参与者替补事件）"
+        )
     )
     ts: datetime = Field(description="事件发生时间（UTC）")
+    # 仅替补事件（result=replaced）出现：被换下的原参与者标识；
+    # 替补事件中 participant_id 为换上的新标识。其余事件不返回该字段。
+    original_participant_id: str | None = Field(
+        default=None,
+        description="仅替补事件出现：被换下的原参与者标识",
+    )
 
 
 class BarrierEventsPage(BaseModel):
