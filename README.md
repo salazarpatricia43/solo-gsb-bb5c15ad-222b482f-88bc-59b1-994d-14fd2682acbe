@@ -8,6 +8,7 @@
 - 并发报到中**首次同时满足总人数与各组配额的瞬间，达标成员与分组计数在 Redis 内被原子冻结**为快照，之后的任何报到（哪怕来自其他名单成员）都不会改写 `quorum` / `frozen_at` / `group_progress`；跨组并发报到也**只有一个请求** `triggered=true`；
 - 支持**主动取消**：取消与达标报到在 Redis 中**原子竞争**，先发生者成为唯一终态（`cancelled` 与 `reached` 互斥）；取消保存 `reason` / `cancelled_at` 并唤醒全部等待者；
 - 支持**运行中延期**：`PATCH /barriers/{id}/deadline` 传入新的**绝对截止时间**，仅当屏障仍处于 `waiting` 且新时间**严格晚于**当前 deadline 时，在一段 Redis Lua 脚本内原子完成状态校验、deadline 写回与**全部相关键存活期刷新**；终态（reached/cancelled/expired）绝不复活；并发延期、报到与取消保持唯一一致结果；延期成功立即通知已挂起的 `/wait` **按最新 deadline 继续等待**，不会按旧截止时间误报 `expired`；
+- 支持**运行中参与者替补**：`POST /barriers/{id}/substitute` 在原参与者**尚未报到**且屏障仍处于 `waiting` 时，于一段 Redis Lua 脚本内**原子地**把名单中的原标识替换为**名单外的新标识**（启用分组配额时**继承原分组**，名单规模与各组人数不变）；替补与报到、取消、延期并发时按 **Redis 实际生效顺序唯一生效**；成功替补追加一条可分页审计事件并**唤醒 `/wait`** 等待者回读最新名单；达标、取消或截止后一律拒绝替补；
 - 提供**阻塞等待接口**：达标 / 取消时立即返回终态快照；截止时返回已报到成员与缺席名单；多个等待者通过 Redis Pub/Sub 一并被可靠唤醒（轮询兜底，消息丢失也不会睡死）。
 
 ## 一条命令启动（含 Redis）
@@ -163,7 +164,7 @@ curl -s -X POST http://localhost:8000/barriers/<id>/cancel \
   - 已截止 → 取消返回 `409`，缺席名单不变。**任何路径都不得改写既有终态。**
 - **重复取消幂等**：返回 `200` 且 `status` 为 `already_cancelled`，`reason` / `cancelled_at` 始终是首次保存的同一份结果（即使本次请求体里的 `reason` 不同）。
 - 取消成功会向 Pub/Sub 频道发布 `cancelled`，**唤醒全部已在 `/wait` 挂起的等待者**；发布丢失时仍有轮询兜底。
-- 取消时已有的报到名单作为快照保留在 `checked_in` 中；取消本身不是报到行为，不产生报到审计事件。
+- 取消时已有的报到名单作为快照保留在 `checked_in` 中；取消本身不是报到行为，不产生审计事件。
 - 屏障不存在/已回收 → `404`。
 
 ### 4. 运行中延期 `PATCH /barriers/{barrier_id}/deadline`
@@ -194,7 +195,7 @@ curl -s -X PATCH http://localhost:8000/barriers/<id>/deadline \
 - 新 deadline **早于或等于**当前 deadline → `409`（`新 deadline 必须严格晚于当前 deadline`）；
 - 屏障已 `reached` / `cancelled` / `expired` → 一律 `409`，文案分别标明达标 / 取消 / 已截止，**终态绝不因延期复活**，快照、缺席名单、取消原因均保持不变；
 - 请求体里的时间本身已是过去时间 → `422`；屏障不存在/已回收 → `404`；
-- 延期只改 deadline 与键存活期，**不是报到行为**，不产生报到审计事件，也不改变任何报到/分组计数。
+- 延期只改 deadline 与键存活期，**不是报到行为**，不产生审计事件，也不改变任何报到/分组计数。
 
 **并发语义（以 Redis 实际生效顺序为准）**：终态校验（frozen / cancel / 是否已过当前 deadline）、新旧 deadline 比较、deadline 写回与**全部 8 个相关键**（meta、roster、checked、frozen、events、cancel、gmap、gcheck）的 `PEXPIRE` 存活期刷新在**同一段 Lua 脚本**内原子完成。因此：
 
@@ -218,7 +219,53 @@ curl -s -X PATCH http://localhost:8000/barriers/<id>/deadline \
   -H 'Content-Type: application/json' -d '{"deadline":"2026-09-21T17:00:00Z"}'
 ```
 
-### 5. 阻塞等待 `GET /barriers/{barrier_id}/wait`
+### 5. 运行中参与者替补 `POST /barriers/{barrier_id}/substitute`
+
+请求体携带**原参与者标识**与**名单外的新标识**（首尾空白会被去除；两者相同或任一空白返回 `422`）。仅当屏障仍处于 `waiting` 且**原参与者尚未报到**时生效：名单中的原标识被**原子替换**为新标识，新标识**继承原参与者的分组**（未启用分组配额时 `group` 为 `null`）。名单规模与各组人数不变，`threshold` 与分组配额语义不受影响。成功后返回更新后的完整 `BarrierView`（200）：
+
+```bash
+curl -s -X POST http://localhost:8000/barriers/<id>/substitute \
+  -H 'Content-Type: application/json' \
+  -d '{"old_participant_id":"node-b","new_participant_id":"node-b-standby"}'
+```
+
+返回（`200`，节选）：
+
+```json
+{
+  "barrier_id": "8f3c…",
+  "status": "substituted",
+  "old_participant_id": "node-b",
+  "new_participant_id": "node-b-standby",
+  "group": null,
+  "view": {
+    "status": "waiting",
+    "participants": ["node-a", "node-b-standby", "node-c"],
+    "checked_in": ["node-a"],
+    "checked_count": 1
+  }
+}
+```
+
+冲突与状态语义：
+
+- 屏障已 `reached` / `cancelled` / `expired` → 一律 `409`，文案分别标明达标 / 取消 / 已截止，**终态绝不因替补改写**，名单、快照、缺席名单均保持不变；
+- 原参与者**已报到** → `409`（其报到已计入总数与分组计数，替换会破坏配额语义）；
+- 原参与者**不在名单内**（不存在或已被替补走）→ `409`；
+- 新标识**已在名单内** → `409`（替补要求名单外的新标识）；
+- 屏障不存在/已回收 → `404`。
+
+**并发语义（以 Redis 实际生效顺序为准）**：终态校验（frozen / cancel / 是否已过当前 deadline）、原参与者在名单且未报到校验、新标识名单外校验、名单改写（`SREM`+`SADD`）、分组映射继承（`gmap` 换名）、**审计事件追加**与全部 8 个相关键的 `PEXPIRE` 存活期刷新在**同一段 Lua 脚本**内原子完成。它与报到、取消、延期脚本在同一 Redis 上串行竞争：
+
+- 替补与旧标识报到并发：替补先生效 → 旧标识报到变 `403`（非名单成员）；报到先生效 → 替补返回 `409`（原参与者已报到）；
+- 替补与取消并发：取消先生效 → 替补返回 `409`；替补先生效 → 取消正常进行；
+- 替补与达标报到并发：达标先生效 → 替补返回 `409`；替补先生效 → 后续报到按**新名单**判定；
+- 替补与延期并发：二者都只在 `waiting` 生效，互不排斥，按 Redis 顺序各自生效；
+- 两个替补并发替换同一原参与者：先执行的成功，后执行的因原标识已不在名单而 `409`。
+
+**审计与唤醒**：成功替补在与名单替换同一原子脚本内向 `events` 列表追加一条 `result="substituted"` 的审计事件（`participant_id` 为新标识，另携带 `replaced_participant_id` 为被替换的原标识），可通过 `GET /barriers/{id}/events` 游标分页读取；被拒绝的替补不产生事件。替补成功后向频道发布 `substituted`，**唤醒全部已在 `/wait` 挂起的等待者**回读最新名单继续等待（替补不是终态，等待者不会因此返回）；此后等待者看到的 `participants` / `missing` / `quorum` 均为替换后的名单。发布丢失时轮询兜底同样会回读最新名单。
+
+### 6. 阻塞等待 `GET /barriers/{barrier_id}/wait`
 
 ```bash
 curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标、取消或截止
@@ -227,9 +274,9 @@ curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标、取
 - 达标时立即返回 `status: "reached"`、冻结的 `quorum` 与 `frozen_at`；
 - 取消时立即返回 `status: "cancelled"`、`cancel_reason` 与 `cancelled_at`；
 - 截止时返回 `status: "expired"`、`checked_in` 已报到名单与 `missing` 缺席名单；
-- 任意数量的等待者并发挂起：达标 / 取消 / 延期各发布一条 Pub/Sub 消息全部唤醒；订阅采用“先订阅后复查 + 轮询兜底”，消息丢失或错过发布也不会漏唤醒（自然截止不发布消息，由轮询在截止点到期兜底）。等待期间 deadline 被延期时，等待者以回读到的**最新 deadline** 为准继续等待，绝不在旧截止点误报 `expired`。
+- 任意数量的等待者并发挂起：达标 / 取消 / 延期 / 替补各发布一条 Pub/Sub 消息全部唤醒；订阅采用“先订阅后复查 + 轮询兜底”，消息丢失或错过发布也不会漏唤醒（自然截止不发布消息，由轮询在截止点到期兜底）。等待期间 deadline 被延期时，等待者以回读到的**最新 deadline** 为准继续等待，绝不在旧截止点误报 `expired`；等待期间名单被替补时，等待者回读**最新名单**后继续等待，最终返回的 `participants` / `missing` / `quorum` 均反映替换后的名单。
 
-### 6. 非阻塞查询 `GET /barriers/{barrier_id}`
+### 7. 非阻塞查询 `GET /barriers/{barrier_id}`
 
 随时查看当前 `waiting / reached / expired / cancelled` 状态、报到人数、冻结快照、缺席与迟到名单、取消原因与时间。
 
@@ -250,13 +297,13 @@ curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标、取
 
 上例中总人数已达 `threshold`，但 `dc3` 配额未满足，屏障仍为 `waiting`。`reached` 后该数组是**冻结快照**（与 `quorum` 同生共死），迟到报到不会推进任何计数；`expired` / `cancelled` 下如实反映终态发生时的进度。未启用分组配额的屏障不返回该字段。
 
-### 7. 报到审计事件 `GET /barriers/{barrier_id}/events`
+### 8. 审计事件 `GET /barriers/{barrier_id}/events`
 
 ```bash
 curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
 ```
 
-每次名单成员报到（`checked_in` / `already_checked_in` / `reached` / `late`）都会在与状态变更**同一 Redis 原子操作**中追加一条有序事件；非名单成员、截止后报到等错误请求不产生事件。
+每次名单成员报到（`checked_in` / `already_checked_in` / `reached` / `late`）与每次**成功替补**（`substituted`）都会在与状态变更**同一 Redis 原子操作**中追加一条有序事件；非名单成员、截止后报到、被拒绝的替补等错误请求不产生事件。
 
 返回（节选）：
 
@@ -264,26 +311,29 @@ curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
 {
   "barrier_id": "8f3c…",
   "events": [
-    {"seq": 1, "participant_id": "node-a", "result": "checked_in", "ts": "2026-09-20T14:59:50.123000Z"},
-    {"seq": 2, "participant_id": "node-b", "result": "reached", "ts": "2026-09-20T14:59:51.456000Z"}
+    {"seq": 1, "participant_id": "node-a", "result": "checked_in", "replaced_participant_id": null, "ts": "2026-09-20T14:59:50.123000Z"},
+    {"seq": 2, "participant_id": "node-b-standby", "result": "substituted", "replaced_participant_id": "node-b", "ts": "2026-09-20T14:59:50.900000Z"},
+    {"seq": 3, "participant_id": "node-b-standby", "result": "reached", "replaced_participant_id": null, "ts": "2026-09-20T14:59:51.456000Z"}
   ],
-  "next_cursor": 2
+  "next_cursor": 3
 }
 ```
 
 - `cursor`：已读到的最大事件序号（`0` 表示从头开始）；`limit`：单页条数（1–1000，默认 100）；
 - 用上一页返回的 `next_cursor` 作为下一页的 `cursor` 即可顺序读完；无新事件时返回空页且 `next_cursor` 不变；
-- 事件只增不改、`seq` 连续递增，游标分页在并发报到下稳定、不重不漏；
+- 替补事件的 `participant_id` 为**新进入名单的标识**，`replaced_participant_id` 为**被替换的原标识**；报到事件的 `replaced_participant_id` 为 `null`；
+- 事件只增不改、`seq` 连续递增，游标分页在并发报到 / 替补下稳定、不重不漏；
 - 事件与屏障其他数据同生命周期：回收前可查询，回收后一并消失（`404`）。
 
 ## 并发与一致性保证
 
 - 报到判定由一段 Lua 脚本完成：`名单校验 → 终态校验（frozen/cancel/截止）→ 去重 SADD（新成员才同步 HINCRBY 对应分组计数）→ 人数与分组配额判定 → 写入冻结快照（quorum + 分组计数）` 整体原子执行；取消由另一段 Lua 脚本完成：`终态校验（cancel/frozen/截止）→ 写入取消快照` 整体原子执行。Redis 单线程串行执行脚本，因此达标与取消**必有且仅有一个赢家**：并发报到（包括不同分组的成员同时补齐各自短板）只有一个请求得到 `reached`，或者取消请求得到 `cancelled`，互斥终态的成员集合、时间点、分组计数、取消原因均唯一确定。
 - 运行中延期由第三段 Lua 脚本完成：`终态校验（frozen/cancel/当前截止）→ 新旧 deadline 严格比较 → 写回 deadline 与重算 ttl_ms → 对全部 8 个键 PEXPIRE` 整体原子执行。它与报到、取消脚本在同一 Redis 上串行竞争：终态已落地（reached / cancelled / expired）时延期返回 `409` 且不复活终态；并发延期以 Redis 实际生效顺序为准，只有新时间严格晚于执行瞬间当前值的请求成功，相同或更早的请求返回 `409`，最终 deadline 唯一确定。延期不触碰 checked / gcheck / frozen / cancel 的任何业务数据，仅更新 meta 中的 deadline 与各键存活期。
+- 运行中替补由第四段 Lua 脚本完成：`终态校验（frozen/cancel/当前截止）→ 原参与者在名单且未报到校验 → 新标识名单外校验 → 名单改写（SREM/SADD）→ gmap 分组继承 → 追加审计事件 → 对全部 8 个键 PEXPIRE` 整体原子执行。它与报到、取消、延期脚本串行竞争，按 Redis 实际生效顺序唯一生效：终态已落地时替补返回 `409` 且不改写任何状态；替换只动 roster / gmap / events，不触碰 checked / gcheck / frozen / cancel 的任何业务数据，名单规模与各组人数保持不变，因此 `threshold` 与分组配额语义在替换前后完全一致。
 - 总数与分组计数都只统计**去重后的唯一报到**：重复报到（`already_checked_in`）与达标后的迟到报到（`late`）均不执行 `HINCRBY`，分组计数不重复累计；达标冻结之后连 `gcheck` 计数也一并冻结。
-- 报到审计事件在同一 Lua 脚本内追加（`RPUSH` 到 `events` 列表，序号 = 列表长度 + 1），与状态变更同生共死：要么一起成功，要么都不发生；脚本串行执行保证 `seq` 从 1 连续递增、无空洞无重复。
-- 终态落地后脚本的所有写路径都不会触碰对方的终态键：迟到报到只追加到 `checked` 集合（反映在 `late` 字段）；取消后的报到不写任何键；已达标 / 已截止后的取消直接返回冲突；已达标 / 已取消 / 已截止后的延期直接返回冲突。
-- 报到响应里的 `PUBLISH reached`、取消响应里的 `PUBLISH cancelled` 与延期响应里的 `PUBLISH deadline_extended` 都在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态（含 meta 中可能已被延期的最新 deadline）。
+- 报到与替补审计事件在同一 Lua 脚本内追加（`RPUSH` 到 `events` 列表，序号 = 列表长度 + 1），与状态变更同生共死：要么一起成功，要么都不发生；脚本串行执行保证 `seq` 从 1 连续递增、无空洞无重复。
+- 终态落地后脚本的所有写路径都不会触碰对方的终态键：迟到报到只追加到 `checked` 集合（反映在 `late` 字段）；取消后的报到不写任何键；已达标 / 已截止后的取消直接返回冲突；已达标 / 已取消 / 已截止后的延期与替补直接返回冲突。
+- 报到响应里的 `PUBLISH reached`、取消响应里的 `PUBLISH cancelled`、延期响应里的 `PUBLISH deadline_extended` 与替补响应里的 `PUBLISH substituted` 都在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态（含 meta 中可能已被延期的最新 deadline 与可能已被替换的最新名单）。
 - 自然截止不发布消息（无后台扫描进程），等待者在剩余截止时间上自然到期回读；该剩余时间每轮都按回读到的最新 deadline 重算，因此延期后旧截止点不会产生误报，避免引入额外调度组件。
 
 ## 本地不使用容器开发
@@ -301,8 +351,8 @@ REDIS_URL=redis://localhost:6379/0 uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py           FastAPI 路由与错误映射
-  barrier_store.py  Redis 键模型 + 原子报到/取消/延期 Lua 脚本（分组配额计数、审计事件、TTL 顺延）+ Pub/Sub
-  service.py        状态机视图组装、阻塞等待（按最新 deadline 回读）
+  barrier_store.py  Redis 键模型 + 原子报到/取消/延期/替补 Lua 脚本（分组配额计数、审计事件、TTL 顺延）+ Pub/Sub
+  service.py        状态机视图组装、阻塞等待（按最新 deadline 与最新名单回读）
   models.py         请求/响应模型与校验
   config.py         环境变量配置
 Dockerfile          API 镜像

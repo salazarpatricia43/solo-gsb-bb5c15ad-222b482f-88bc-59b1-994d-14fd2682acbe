@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.title="task-barrier-api" \
+      org.opencontainers.image.description="并行任务协调收尾屏障 API：幂等报到、阻塞等待、取消、运行中延期与参与者替补" \
+      org.opencontainers.image.version="1.4.0"
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1

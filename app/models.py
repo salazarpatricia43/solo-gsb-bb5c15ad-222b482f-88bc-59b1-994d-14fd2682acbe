@@ -220,12 +220,49 @@ class CancelResponse(BaseModel):
     view: BarrierView
 
 
+class SubstituteRequest(BaseModel):
+    old_participant_id: str = Field(
+        ..., min_length=1, description="被替换的原参与者标识（须在名单内且尚未报到）"
+    )
+    new_participant_id: str = Field(
+        ..., min_length=1, description="名单外的新参与者标识，继承原参与者的分组"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "SubstituteRequest":
+        old = self.old_participant_id.strip()
+        new = self.new_participant_id.strip()
+        if not old or not new:
+            raise ValueError("参与者标识不得为空白字符串")
+        if old == new:
+            raise ValueError("新旧参与者标识不得相同")
+        self.old_participant_id = old
+        self.new_participant_id = new
+        return self
+
+
+class SubstituteResponse(BaseModel):
+    barrier_id: str
+    status: str = Field(description="substituted（本次完成替补）")
+    old_participant_id: str = Field(description="被替换出名单的原参与者标识")
+    new_participant_id: str = Field(description="进入名单的新参与者标识")
+    group: str | None = Field(
+        default=None,
+        description="新参与者继承的分组名；未启用分组配额时为 null",
+    )
+    view: BarrierView
+
+
 class CheckinEvent(BaseModel):
     seq: int = Field(description="事件序号，从 1 开始单调递增，只追加不回改")
-    participant_id: str = Field(description="报到的参与者标识")
-    result: str = Field(
-        description="checked_in | already_checked_in | reached | late"
+    participant_id: str = Field(
+        description="报到的参与者标识；substituted 事件为新进入名单的标识"
     )
+    result: str = Field(
+        description="checked_in | already_checked_in | reached | late | substituted"
+    )
+    # 仅 substituted 事件携带：被替换出名单的原参与者标识
+    replaced_participant_id: str | None = None
     ts: datetime = Field(description="事件发生时间（UTC）")
 
 

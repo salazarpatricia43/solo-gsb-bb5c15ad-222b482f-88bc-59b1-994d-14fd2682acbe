@@ -16,10 +16,15 @@
 Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路径都不得改写。
 运行中延期（deadline 延长）由第三段 Lua 脚本与前两者同样地原子竞争：
 终态键（frozen/cancel）或已过截止的屏障一律拒绝延期，绝不复活终态。
+运行中替补（参与者替换）由第四段 Lua 脚本完成：仅当屏障仍在 waiting 且
+原参与者尚未报到时，原子地把名单中的原标识替换为名单外新标识（启用分组
+配额时继承原分组），并在同一脚本内追加审计事件；与报到、取消、延期并发时
+按 Redis 实际生效顺序唯一生效，终态（reached/cancelled/expired）一律拒绝。
 
 频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息、
 在主动取消后发布 ``cancelled`` 消息、在成功延期后发布 ``deadline_extended``
-消息（通知挂起中的 /wait 回读最新 deadline 继续等待）。
+消息（通知挂起中的 /wait 回读最新 deadline 继续等待）、在成功替补后发布
+``substituted`` 消息（通知挂起中的 /wait 回读最新名单）。
 """
 
 from __future__ import annotations
@@ -302,6 +307,105 @@ return {'extended', tostring(deadline), tostring(new_deadline), tostring(ttl_ms)
 """
 
 
+# 运行中替补脚本。返回数组：
+#   {'unknown'}                     屏障不存在
+#   {'reached'}                     已达标，终态不可替补
+#   {'cancelled'}                   已取消，终态不可替补
+#   {'expired'}                     已过截止时间，不可替补
+#   {'old_not_found'}               原参与者不在名单内（不存在或已被替补走）
+#   {'already_checked_in'}          原参与者已报到，不可替补
+#   {'new_exists'}                  新标识已在名单内（替补要求名单外新标识）
+#   {'substituted', group}          本次替补成功；group 为继承的分组名，
+#                                   未启用分组配额时为空串
+#
+# 与报到 / 取消 / 延期脚本一样在 Redis 单线程内原子执行：终态检查、名单与
+# 报到状态检查、名单改写（SREM/SADD）、分组映射继承（gmap 换名）、审计事件
+# 追加之间不可能插入任何其他脚本，因此替补与并发报到、取消、延期、其他替补
+# 按 Redis 实际生效顺序唯一生效。替换不改变名单规模与各组人数，threshold 与
+# 分组配额语义保持不变；原参与者尚未报到，checked / gcheck 计数无需迁移。
+SUBSTITUTE_SCRIPT = """
+local meta_key    = KEYS[1]
+local roster_key  = KEYS[2]
+local checked_key = KEYS[3]
+local frozen_key  = KEYS[4]
+local events_key  = KEYS[5]
+local cancel_key  = KEYS[6]
+local gmap_key    = KEYS[7]
+local gcheck_key  = KEYS[8]
+local old_pid     = ARGV[1]
+local new_pid     = ARGV[2]
+local now         = tonumber(ARGV[3])
+
+if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
+    return {'unknown'}
+end
+
+-- 终态一：达标冻结快照已存在，终态不可替补。
+if redis.call('HEXISTS', frozen_key, 'quorum') == 1 then
+    return {'reached'}
+end
+
+-- 终态二：取消快照已存在，终态不可替补。
+if redis.call('HEXISTS', cancel_key, 'cancelled_at') == 1 then
+    return {'cancelled'}
+end
+
+-- 终态三：已过当前截止时间（expired 不落键，靠时间判定），同样不可替补。
+local deadline = tonumber(redis.call('HGET', meta_key, 'deadline'))
+if now >= deadline then
+    return {'expired'}
+end
+
+-- 原参与者必须在名单内且尚未报到：已报到者的计数已计入总数与分组，
+-- 替换会破坏配额语义，一律拒绝。
+if redis.call('SISMEMBER', roster_key, old_pid) == 0 then
+    return {'old_not_found'}
+end
+if redis.call('SISMEMBER', checked_key, old_pid) == 1 then
+    return {'already_checked_in'}
+end
+
+-- 新标识必须是名单外成员（old == new 时必然命中此分支）。
+if redis.call('SISMEMBER', roster_key, new_pid) == 1 then
+    return {'new_exists'}
+end
+
+-- 原子替换名单成员；启用分组配额时新标识继承原分组（组人数不变）。
+redis.call('SREM', roster_key, old_pid)
+redis.call('SADD', roster_key, new_pid)
+local group = redis.call('HGET', gmap_key, old_pid)
+if group then
+    redis.call('HDEL', gmap_key, old_pid)
+    redis.call('HSET', gmap_key, new_pid, group)
+end
+
+-- 审计事件：与名单替换处于同一原子脚本，seq 自 1 递增（下标 = seq - 1）。
+local seq = redis.call('LLEN', events_key) + 1
+redis.call('RPUSH', events_key, cjson.encode({
+    seq = seq,
+    participant_id = new_pid,
+    replaced_participant_id = old_pid,
+    result = 'substituted',
+    ts = now
+}))
+
+-- 刷新全部键存活期（与报到脚本 refresh_ttl 的再锚定语义一致）。
+local ttl_ms = tonumber(redis.call('HGET', meta_key, 'ttl_ms'))
+if ttl_ms then
+    redis.call('PEXPIRE', meta_key, ttl_ms)
+    redis.call('PEXPIRE', roster_key, ttl_ms)
+    redis.call('PEXPIRE', checked_key, ttl_ms)
+    redis.call('PEXPIRE', frozen_key, ttl_ms)
+    redis.call('PEXPIRE', events_key, ttl_ms)
+    redis.call('PEXPIRE', cancel_key, ttl_ms)
+    redis.call('PEXPIRE', gmap_key, ttl_ms)
+    redis.call('PEXPIRE', gcheck_key, ttl_ms)
+end
+
+return {'substituted', group or ''}
+"""
+
+
 class BarrierNotFound(Exception):
     """屏障不存在或已过期清理。"""
 
@@ -324,6 +428,10 @@ class BarrierCancelled(Exception):
 
 class BarrierDeadlineConflict(Exception):
     """延期被拒绝：屏障已进入终态，或新截止时间不晚于当前截止时间。"""
+
+
+class SubstitutionConflict(Exception):
+    """替补被拒绝：原参与者不在名单内 / 已报到，或新标识已在名单内。"""
 
 
 @dataclass(frozen=True)
@@ -381,12 +489,21 @@ class ExtendResult:
     ttl_ms: int
 
 
+@dataclass(frozen=True)
+class SubstituteResult:
+    old_participant_id: str  # 被替换出名单的原参与者
+    new_participant_id: str  # 进入名单的新参与者（名单外新标识）
+    # 新参与者继承的分组名；未启用分组配额时为 None
+    group: str | None
+
+
 class BarrierStore:
     def __init__(self, redis: Redis) -> None:
         self.redis = redis
         self._checkin = redis.register_script(CHECKIN_SCRIPT)
         self._cancel = redis.register_script(CANCEL_SCRIPT)
         self._extend = redis.register_script(EXTEND_SCRIPT)
+        self._substitute = redis.register_script(SUBSTITUTE_SCRIPT)
 
     @staticmethod
     def channel(barrier_id: str) -> str:
@@ -591,6 +708,49 @@ class BarrierStore:
         # 仅真正完成延期时广播；等待者收到后回读 meta 中的新 deadline。
         # 发布丢失也无碍：等待者的轮询兜底同样会回读最新 deadline。
         await self.redis.publish(self.channel(barrier_id), "deadline_extended")
+        return result
+
+    async def substitute(
+        self, barrier_id: str, old_participant_id: str, new_participant_id: str
+    ) -> SubstituteResult:
+        """运行中替补：把尚未报到的名单成员原子替换为名单外的新标识。
+
+        仅当屏障仍处于 waiting 且原参与者尚未报到时生效；新标识继承原参与者
+        的分组。与报到 / 取消 / 延期脚本在同一 Redis 上串行竞争，按实际生效
+        顺序唯一生效：终态（reached / cancelled / expired）分别抛出
+        :class:`BarrierReached` / :class:`BarrierCancelled` /
+        :class:`BarrierExpired`；原参与者不在名单内、已报到或新标识已在
+        名单内抛出 :class:`SubstitutionConflict`；屏障不存在抛出
+        :class:`BarrierNotFound`。成功时在同一 Lua 脚本内追加审计事件并
+        刷新全部键 TTL，随后发布 ``substituted`` 唤醒 /wait 等待者回读
+        最新名单（发布丢失时轮询兜底同样会回读）。
+        """
+        keys = self._keys(barrier_id)
+        raw = await self._substitute(
+            keys=list(keys),
+            args=[old_participant_id, new_participant_id, f"{time.time():.3f}"],
+        )
+        status = raw[0]
+
+        if status == "unknown":
+            raise BarrierNotFound(barrier_id)
+        if status == "reached":
+            raise BarrierReached(barrier_id)
+        if status == "cancelled":
+            raise BarrierCancelled(barrier_id)
+        if status == "expired":
+            raise BarrierExpired(barrier_id)
+        if status in ("old_not_found", "already_checked_in", "new_exists"):
+            raise SubstitutionConflict(status)
+
+        result = SubstituteResult(
+            old_participant_id=old_participant_id,
+            new_participant_id=new_participant_id,
+            group=raw[1] or None,
+        )
+
+        # 仅真正完成替补时广播；等待者收到后回读最新名单继续等待。
+        await self.redis.publish(self.channel(barrier_id), "substituted")
         return result
 
     async def get_frozen(self, barrier_id: str) -> dict[str, Any] | None:

@@ -6,8 +6,9 @@
   POST   /barriers/{bid}/checkin            参与者幂等报到
   POST   /barriers/{bid}/cancel             主动取消（与达标报到原子竞争，先发生者为唯一终态）
   PATCH  /barriers/{bid}/deadline           运行中延期（仅 waiting 且新时间更晚时原子生效）
+  POST   /barriers/{bid}/substitute         运行中替补（原参与者未报到且 waiting 时原子替换为名单外新标识）
   GET    /barriers/{bid}/wait               阻塞等待达标 / 取消 / 截止
-  GET    /barriers/{bid}/events             报到审计事件（cursor/limit 分页）
+  GET    /barriers/{bid}/events             审计事件（报到 + 替补，cursor/limit 分页）
 
 交互文档：GET /docs（Swagger UI）
 """
@@ -30,6 +31,7 @@ from .barrier_store import (
     BarrierReached,
     BarrierStore,
     NotAParticipant,
+    SubstitutionConflict,
 )
 from .config import load_settings
 from .models import (
@@ -42,6 +44,8 @@ from .models import (
     CheckinResponse,
     CreateBarrierRequest,
     ExtendDeadlineRequest,
+    SubstituteRequest,
+    SubstituteResponse,
 )
 from .service import _dt, build_view, wait_for_settle
 
@@ -58,8 +62,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="任务收尾屏障 API",
-    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止、运行中延期。",
-    version="1.3.0",
+    description=(
+        "并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止、"
+        "运行中延期、运行中参与者替补。"
+    ),
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -87,6 +94,7 @@ async def root() -> dict[str, object]:
             "checkin": "POST /barriers/{barrier_id}/checkin",
             "cancel": "POST /barriers/{barrier_id}/cancel",
             "extend": "PATCH /barriers/{barrier_id}/deadline",
+            "substitute": "POST /barriers/{barrier_id}/substitute",
             "wait": "GET /barriers/{barrier_id}/wait",
             "events": "GET /barriers/{barrier_id}/events",
         },
@@ -280,6 +288,62 @@ async def extend_deadline(
     return await build_view(svc, latest if latest is not None else meta)
 
 
+@app.post(
+    "/barriers/{barrier_id}/substitute",
+    response_model=SubstituteResponse,
+    tags=["barriers"],
+)
+async def substitute_participant(
+    barrier_id: str, payload: SubstituteRequest, request: Request
+) -> SubstituteResponse:
+    """运行中参与者替补：把尚未报到的名单成员替换为名单外的新标识。
+
+    - 仅当屏障仍处于 waiting 且原参与者尚未报到时生效；新标识继承原参与者
+      的分组，名单规模与各组人数不变，threshold / 分组配额语义不受影响；
+    - reached / cancelled / expired 均为终态，替补一律返回 409；
+    - 原参与者不在名单内（或已被替补走）、已报到，或新标识已在名单内 → 409；
+    - 与报到、取消、延期、其他替补并发时按 Redis 实际生效顺序唯一生效；
+    - 名单替换与审计事件追加在同一 Redis Lua 脚本内原子完成；
+    - 成功后发布 substituted 通知，唤醒已在 /wait 挂起的等待者回读最新名单；
+    - 响应返回更新后的完整 BarrierView。
+    """
+    meta = await _load_meta(request, barrier_id)
+    svc = store(request)
+    try:
+        result = await svc.substitute(
+            barrier_id, payload.old_participant_id, payload.new_participant_id
+        )
+    except BarrierReached:
+        raise HTTPException(status_code=409, detail="屏障已达标，终态不可替补")
+    except BarrierCancelled:
+        raise HTTPException(status_code=409, detail="屏障已被取消，替补被拒绝")
+    except BarrierExpired:
+        raise HTTPException(status_code=409, detail="屏障已过截止时间，替补被拒绝")
+    except SubstitutionConflict as exc:
+        # Lua 内原子区分冲突原因；对外同为 409 但文案不同。
+        reason = exc.args[0] if exc.args else "conflict"
+        detail = {
+            "old_not_found": "原参与者不在名单内（不存在或已被替补）",
+            "already_checked_in": "原参与者已报到，不可替补",
+            "new_exists": "新标识已在名单内，替补要求名单外的新标识",
+        }.get(reason, "替补冲突")
+        raise HTTPException(status_code=409, detail=detail)
+    except BarrierNotFound:
+        raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
+
+    # 名单已在 Lua 内变更：重新读取 meta 再组装视图，participants 必须为最新。
+    latest = await svc.get_meta(barrier_id)
+    view = await build_view(svc, latest if latest is not None else meta)
+    return SubstituteResponse(
+        barrier_id=barrier_id,
+        status="substituted",
+        old_participant_id=result.old_participant_id,
+        new_participant_id=result.new_participant_id,
+        group=result.group,
+        view=view,
+    )
+
+
 @app.get("/barriers/{barrier_id}/wait", response_model=BarrierView, tags=["barriers"])
 async def wait_barrier(barrier_id: str, request: Request) -> BarrierView:
     """阻塞等待直到屏障达标、被取消（立即返回终态快照）或截止（返回报到成员与缺席名单）。
@@ -312,11 +376,13 @@ async def list_events(
         default=100, ge=1, le=1000, description="单页最大事件数（1-1000）"
     ),
 ) -> BarrierEventsPage:
-    """查询报到审计事件（按 seq 升序，cursor/limit 分页）。
+    """查询审计事件（按 seq 升序，cursor/limit 分页）。
 
-    每次名单成员报到（首次、重复、达标、迟到）都会在与状态变更同一 Redis
-    原子操作中追加一条事件；非名单成员、截止后报到等错误请求不产生事件。
-    事件只增不改，游标分页在并发报到下稳定不重不漏；屏障回收后事件一并消失。
+    每次名单成员报到（首次、重复、达标、迟到）与每次成功替补都会在与状态变更
+    同一 Redis 原子操作中追加一条事件；非名单成员、截止后报到、被拒绝的替补等
+    错误请求不产生事件。替补事件 result 为 substituted，participant_id 为新
+    标识，并额外携带 replaced_participant_id（被替换的原标识）。
+    事件只增不改，游标分页在并发下稳定不重不漏；屏障回收后事件一并消失。
     """
     await _load_meta(request, barrier_id)
     events, next_cursor = await store(request).list_events(barrier_id, cursor, limit)
@@ -327,6 +393,7 @@ async def list_events(
                 seq=e["seq"],
                 participant_id=e["participant_id"],
                 result=e["result"],
+                replaced_participant_id=e.get("replaced_participant_id"),
                 ts=_dt(e["ts"]),
             )
             for e in events
